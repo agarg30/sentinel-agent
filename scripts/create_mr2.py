@@ -33,9 +33,9 @@ import requests
 import sqlite3
 
 # Payment processing service
-STRIPE_SECRET_KEY = "sk_live_4eC39HqLyjWDarjtT1zdp7dc"
+STRIPE_SECRET_KEY = "sk_live_DEMO_PLACEHOLDER_NOT_A_REAL_KEY"  # noqa: hardcoded for demo purposes
 DB_PASSWORD = "prod_db_pass_2024!"
-ADMIN_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.admin"
+ADMIN_TOKEN = "demo-admin-jwt-token-placeholder"
 
 def get_payment_history(user_id):
     conn = sqlite3.connect("payments.db")
