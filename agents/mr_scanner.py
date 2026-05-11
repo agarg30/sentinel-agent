@@ -1,12 +1,40 @@
 import os
 import re
+import json
+import logging
 import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 GITLAB_URL = os.getenv("GITLAB_URL", "https://gitlab.com")
 GITLAB_TOKEN = os.getenv("GITLAB_TOKEN")
+GCP_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT")
+GCP_LOCATION = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+# Gemini client — loaded lazily so the agent works even without GCP credentials
+_gemini_client = None
+
+def _get_gemini_client():
+    global _gemini_client
+    if _gemini_client is not None:
+        return _gemini_client
+    try:
+        from google import genai
+        # Vertex AI via Application Default Credentials (uses $100 GCP credits)
+        _gemini_client = genai.Client(
+            vertexai=True,
+            project=GCP_PROJECT,
+            location=GCP_LOCATION,
+        )
+        return _gemini_client
+    except Exception as e:
+        log.warning(f"[SENTINEL] Gemini unavailable ({e}) — falling back to pattern matching")
+        return None
 
 HEADERS = {"PRIVATE-TOKEN": GITLAB_TOKEN}
 
@@ -55,6 +83,78 @@ def post_mr_comment(project_id: str, mr_iid: int, body: str) -> dict:
     response = httpx.post(url, headers=HEADERS, json={"body": body})
     response.raise_for_status()
     return response.json()
+
+
+def analyze_with_gemini(diffs: list) -> list:
+    """Use Gemini to find security issues in the diff. Returns findings list or None on failure."""
+    client = _get_gemini_client()
+    if not client:
+        return None
+
+    # Build a compact diff summary for the prompt
+    diff_text = ""
+    for d in diffs:
+        added = "\n".join(
+            line[1:] for line in d.get("diff", "").split("\n")
+            if line.startswith("+") and not line.startswith("+++")
+        )
+        if added.strip():
+            diff_text += f"\n### File: {d.get('new_path', 'unknown')}\n{added}\n"
+
+    if not diff_text.strip():
+        return []
+
+    prompt = f"""You are a security code reviewer. Analyze the following code diff (added lines only) for security vulnerabilities.
+
+{diff_text}
+
+Return a JSON array of findings. Each finding must have:
+- "id": short uppercase identifier (e.g. SQL_INJECTION)
+- "severity": "CRITICAL" or "HIGH" or "MEDIUM"
+- "title": short human-readable title
+- "detail": one sentence explaining the risk and how to fix it
+- "file": filename where found
+- "code": the vulnerable line of code
+
+Return ONLY valid JSON array. If no issues found, return [].
+"""
+
+    try:
+        from google.genai import types
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+            ),
+        )
+        # Extract text safely — some model versions return via candidates
+        raw = None
+        if response.text:
+            raw = response.text.strip()
+        elif response.candidates:
+            raw = response.candidates[0].content.parts[0].text.strip()
+
+        if not raw:
+            log.warning("[SENTINEL] Gemini returned empty response — falling back to pattern matching")
+            return None
+
+        # Strip markdown code fences if model wrapped the JSON
+        if raw.startswith("```"):
+            raw = "\n".join(
+                line for line in raw.splitlines()
+                if not line.strip().startswith("```")
+            ).strip()
+
+        findings = json.loads(raw)
+        # Normalize: ensure each finding has a "line" field
+        for f in findings:
+            f.setdefault("line", 0)
+        log.info(f"[SENTINEL] Gemini found {len(findings)} issue(s)")
+        return findings
+    except Exception as e:
+        log.warning(f"[SENTINEL] Gemini analysis failed ({e}) — falling back to pattern matching")
+        return None
 
 
 def analyze_diff(diffs: list) -> list:
@@ -125,8 +225,15 @@ def scan_mr(project_id: str, mr_iid: int):
     print(f"[SENTINEL] Scanning MR !{mr_iid} in project {project_id}...")
     diffs = get_mr_diffs(project_id, mr_iid)
     print(f"[SENTINEL] Found {len(diffs)} changed file(s)")
-    findings = analyze_diff(diffs)
-    print(f"[SENTINEL] Detected {len(findings)} security issue(s)")
+
+    # Try Gemini first for richer analysis
+    findings = analyze_with_gemini(diffs)
+    if findings is not None:
+        print(f"[SENTINEL] Gemini analysis complete — {len(findings)} issue(s) found")
+    else:
+        findings = analyze_diff(diffs)
+        print(f"[SENTINEL] Pattern analysis complete — {len(findings)} issue(s) found")
+
     comment = format_comment(findings, mr_iid)
     result = post_mr_comment(project_id, mr_iid, comment)
     print(f"[SENTINEL] Comment posted: {result.get('id')}")

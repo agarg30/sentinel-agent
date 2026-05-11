@@ -1,5 +1,4 @@
-google-cloud-aiplatform>=1.91.0
-google-adk
+google-genai>=1.0.0
 requests>=2.31.0
 python-dotenv>=1.0.0
 fastapi>=0.110.0

@@ -1,0 +1,10 @@
+.env
+*.env
+.git
+__pycache__
+*.pyc
+*.pyo
+venv/
+.vscode/
+scripts/
+myNotes.txt
